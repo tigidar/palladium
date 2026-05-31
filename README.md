@@ -19,6 +19,218 @@ Scala Native.
 
 ---
 
+## A transformer, block by block
+
+The fastest way to feel the library is to build a Transformer from scratch — not
+by reaching for a `Transformer()` constructor, but by *deriving* one from a
+handful of tiny, pure building blocks. Every block below is an ordinary
+`Ein[Double] => Ein[Double]` function: it takes a tensor *expression* and returns
+a bigger tensor expression. Nothing computes — we are assembling **data** that an
+interpreter (eval, autograd, C codegen, BLAS) will later walk.
+
+The whole trick of the DSL is **named dimensions**. Two operands that share a
+dim name get *contracted* — summed over that axis, i.e. a matmul — while
+everything else broadcasts element-wise. That single rule is enough to express
+the entire attention mechanism.
+
+```scala
+import palladium.ein.*
+import palladium.ein.EinDsl.*
+import palladium.ein.EinDsl.syntax.*   // `.eval`, `.softmax`, `.elemMul`, …
+import scala.util.Random
+
+given Random = Random(0L)
+
+// He-style init as a plain array — a weight is just numbers.
+def randn(n: Int, fanIn: Int)(using rng: Random): Array[Double] =
+  val s = math.sqrt(2.0 / fanIn); Array.fill(n)(rng.nextGaussian() * s)
+```
+
+### Block 0 — a named tensor and its shape
+
+```scala
+val seq   = 16.dim                 // Dim("seq", 16)   — sequence positions
+val model = 64.dim                 // Dim("model", 64) — embedding width
+
+val x = input[Double](seq, model)  // Ein.Input("x", [seq, model]); name = the val binding
+x.outputDims                       // List(Dim("seq",16), Dim("model",64))
+```
+
+Dims are values. `16.dim` names itself after the binding (`seq`) via
+`sourcecode.Name`, and `input` likewise takes its id from the `x` binding — so
+the math reads the way you'd write it on a whiteboard.
+
+### Block 1 — the linear layer (the one atom everything is made of)
+
+A weight is *just data* (`Ein.Param` wrapping a `TensorData`), and a linear layer
+is *just a contraction plus a broadcasted bias*. The weight is shaped
+`[out, in]`; sharing the `in` dim name with the activation is what turns `w * x`
+into a matrix multiply.
+
+```scala
+def linear(name: String, in: Dim, out: Dim)(x: Ein[Double])(using rng: Random): Ein[Double] =
+  val w = Ein.Param(s"$name.W", List(out, in),
+            TensorData.fromArray(List(out, in), randn(out.size * in.size, in.size)))
+  val b = Ein.Param(s"$name.b", List(out),
+            TensorData.fromArray(List(out), Array.fill(out.size)(0.0)))
+  (w * x) + b          // `*` contracts the shared `in` dim; `+` broadcasts the bias over it
+
+// linear("proj", model, model)(x)  ⟶  shape [model, seq]
+```
+
+### Block 2 — scaled dot-product attention (one head)
+
+This is the heart of a Transformer, and it falls straight out of the contraction
+rule. The catch: queries and keys both come from the same `[seq, model]` tensor,
+so we must *rename* the key/value sequence axis to `kSeq` — otherwise `Q × K`
+would contract over `seq` too. Renaming is a zero-cost `Ein.Reshape` to the same
+sizes under new names. Then `Q × K` contracts only over `dk`, leaving a
+`[seq, kSeq]` score matrix.
+
+```scala
+// scale every element by a constant: multiply by a Fill of the same shape
+def scaleBy(e: Ein[Double], c: Double): Ein[Double] =
+  e.elemMul(Ein.Fill(c, e.outputDims))
+
+def attentionHead(name: String, model: Dim, dk: Dim)(x: Ein[Double])(using Random): Ein[Double] =
+  val kSeq = Dim("kSeq", x.outputDims.find(_.name == "seq").get.size)
+  val xKV  = Ein.Reshape(x, x.outputDims.map(d => if d.name == "seq" then kSeq else d))
+
+  val q = linear(s"$name.q", model, dk)(x)                      // [dk, seq]
+  val k = linear(s"$name.k", model, dk)(xKV)                    // [dk, kSeq]
+  val v = linear(s"$name.v", model, dk)(xKV)                    // [dk, kSeq]
+
+  val scores  = scaleBy(q * k, 1.0 / math.sqrt(dk.size))        // [seq, kSeq]  (contracts dk)
+  val weights = scores.softmax("kSeq")                          // [seq, kSeq]  (normalize keys)
+  weights * v                                                   // [seq, dk]    (contracts kSeq)
+```
+
+Read the three contractions straight off the dim names: `q * k` shares `dk`,
+`softmax` normalizes along `kSeq`, and `weights * v` shares `kSeq`. No index
+arithmetic, no manual stride juggling — the names *are* the bookkeeping.
+
+### Block 3 — multi-head attention
+
+There's no batched-matmul op yet (it's on the roadmap), and we don't need one:
+heads are independent, so we unroll them in plain Scala and *sum each head's
+output projection*. Summing the per-head `Wᴼ` projections is mathematically
+identical to concatenating the heads and projecting once.
+
+```scala
+def multiHead(name: String, model: Dim, heads: Int, dk: Dim)(x: Ein[Double])(using Random): Ein[Double] =
+  (0 until heads)
+    .map { h =>
+      val ctx = attentionHead(s"$name.h$h", model, dk)(x)       // [seq, dk]
+      linear(s"$name.o$h", dk, model)(ctx)                      // [model, seq]
+    }
+    .reduce(_ + _)                                              // [model, seq]
+```
+
+### Block 4 — the position-wise feed-forward network
+
+```scala
+def feedForward(name: String, model: Dim, hidden: Dim)(x: Ein[Double])(using Random): Ein[Double] =
+  val h = gelu(linear(s"$name.in", model, hidden)(x))          // [hidden, seq]
+  linear(s"$name.out", hidden, model)(h)                       // [model, seq]
+```
+
+### Block 5 — Add & Norm (residual + layer normalization)
+
+`LayerNorm` carries its own learnable `scale`/`bias` params and the dims to
+normalize over. Element-wise `+` matches operands *by name*, so the residual
+works even though attention hands back `[model, seq]` and the input is
+`[seq, model]`.
+
+```scala
+def layerNorm(name: String, model: Dim)(x: Ein[Double]): Ein[Double] =
+  val scale = Ein.Param(s"$name.scale", List(model), TensorData.fill(List(model), 1.0))
+  val bias  = Ein.Param(s"$name.bias",  List(model), TensorData.fromArray(List(model), Array.fill(model.size)(0.0)))
+  Ein.LayerNorm(x, scale, bias, List("model"), eps = 1e-5)
+
+// the classic "x + sublayer(x), then normalize"
+def addNorm(name: String, model: Dim)(x: Ein[Double], sublayer: Ein[Double]): Ein[Double] =
+  layerNorm(name, model)(x + sublayer)
+```
+
+### Block 6 — assembling one Transformer block
+
+Now the famous diagram is literally two `addNorm`s:
+
+```scala
+def transformerBlock(name: String, model: Dim, heads: Int, dk: Dim, hidden: Dim)(x: Ein[Double])(using Random): Ein[Double] =
+  val a = addNorm(s"$name.ln1", model)(x, multiHead(s"$name.attn", model, heads, dk)(x))
+  val b = addNorm(s"$name.ln2", model)(a, feedForward(s"$name.ffn", model, hidden)(a))
+  b   // shape preserved: [seq, model] in, [seq, model] out
+
+// stacking is ordinary function composition, because the shape round-trips:
+def encoder(layers: Int, model: Dim, heads: Int, dk: Dim, hidden: Dim)(x: Ein[Double])(using Random): Ein[Double] =
+  (0 until layers).foldLeft(x)((h, i) => transformerBlock(s"layer$i", model, heads, dk, hidden)(h))
+```
+
+### Block 7 — a complete model you can actually run
+
+Embed token ids (a `Gather` over an embedding table), add a learned positional
+table, run the encoder stack, and project to vocabulary logits. Because the
+embedding table, positions, and all weights are `Param`s — and the token ids are
+concrete data — the whole thing evaluates with an *empty* feed.
+
+```scala
+val vocab  = 1000.dim
+val heads  = 4
+val dk     = 16.dim                                  // 4 heads × 16 = 64 = model
+val hidden = 256.dim
+
+// a sentence of 16 token ids, as concrete integer data
+val ids   = TensorData.fromArray(List(seq), Array.tabulate(seq.size)(i => (i * 7) % vocab.size))
+val table = Ein.Param("tok_embed", List(vocab, model),
+              TensorData.fromArray(List(vocab, model), randn(vocab.size * model.size, model.size)))
+val pos   = Ein.Param("pos_embed", List(seq, model),
+              TensorData.fromArray(List(seq, model), Array.fill(seq.size * model.size)(0.0)))
+
+val embedded = Ein.Gather(table, ids, "vocab")       // [seq, model]
+val h0       = embedded + pos                         // [seq, model]
+val out      = encoder(layers = 2, model, heads, dk, hidden)(h0)
+val logits   = linear("lm_head", model, vocab)(out)  // [vocab, seq]
+val probs    = logits.softmax("vocab")               // next-token distribution per position
+
+val result: TensorData[Double] = probs.eval()        // forward pass — actually computes!
+```
+
+That's a working Transformer expressed entirely in pure data. Every other
+interpreter in the library is likewise just a function over `probs`:
+
+```scala
+import palladium.codegen.{Lower, CGen}
+
+val program = Lower.lower(probs)        // erase named dims → index-based IR
+val cSource = CGen.generate(program)    // → self-contained, dependency-free C
+probs.backward()                        // reverse-mode tensor autodiff → Map[String, TensorData]
+EinTrace.forward(probs)                 // a DAG you can render with Mermaid
+```
+
+### The same thing, batteries included
+
+These blocks aren't just a tutorial — the library ships them as composable
+`Block` atoms, so the entire stack above collapses to:
+
+```scala
+import palladium.ein.Block
+import palladium.ein.Block.{*, given}
+
+val net: Ein[Double] =
+  (input[Double](seq, model)
+    >> Block.transformer[Double](nLayers = 2, nHeads = 4, headDim = 16, ffDim = 256, seqLen = 16)
+    >> Block.layerNorm[Double](List("model"))).materialize
+```
+
+Notice what we *didn't* need anywhere: no special "attention type," no shape
+generics, no framework base class. A Transformer is just `linear`, contraction,
+`softmax`, `LayerNorm`, and `+` — composed with ordinary Scala. The rest of this
+document is about the algebras, interpreters, and backends that make that
+possible.
+
+---
+
 ## Why Palladium
 
 Palladium is built around a single idea: an expression tree is just data, and
