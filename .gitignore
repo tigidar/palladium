@@ -1,0 +1,14 @@
+
+out/
+.bsp/
+.metals/
+node_modules/
+
+# Symlinked ScalaJS output (created by `make link-fast`)
+web-frontend/web/lib/
+
+.
+.mcp.json
+
+*.png
+

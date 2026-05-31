@@ -1,0 +1,7 @@
+package build.deps
+
+import mill.*, scalalib.*
+
+// This is a marker that this contains a mill module
+// Opens up for support build files like Versions.mill and Dependencies.mill
+object `package` extends Module

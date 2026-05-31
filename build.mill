@@ -1,0 +1,195 @@
+//| mill-version: 1.1.2
+//| mill-jvm-version: system
+//| mvnDeps: [ "com.lihaoyi::mill-contrib-buildinfo:$MILL_VERSION", "org.typelevel::scalac-options:0.1.8" ]
+package build
+
+import mill.*, scalalib.*, scalajslib.*, scalajslib.api.*, scalanativelib.*
+import deps.{Versions => V, Lihaoyi, Munit, Scodec, SafeTensors, Tapir, ScalaJsDom}
+
+// =============================================================================
+// Common Traits (following tagless patterns)
+// =============================================================================
+
+trait CommonSettings extends ScalaModule {
+  def scalaVersion = V.scala
+}
+
+trait CommonTestConfig extends TestModule.Munit {
+  override def mvnDeps = super.mvnDeps() ++ Seq(Munit.munit)
+}
+
+trait Shared extends CrossScalaModule with PlatformScalaModule {
+  override def mvnDeps = super.mvnDeps() ++ Seq(
+    Lihaoyi.sourcecode,
+    Scodec.core,
+    SafeTensors.safetensorsScala
+  )
+}
+
+trait Js extends Shared with ScalaJSModule {
+  override def scalaJSVersion = V.scalaJS
+}
+
+trait Native extends Shared with ScalaNativeModule {
+  override def scalaNativeVersion = V.scalaNative
+
+  // Remove JVM-specific -release option (incompatible with Native)
+  override def scalacOptions = Task {
+    super
+      .scalacOptions()
+      .filterNot(opt =>
+        opt.startsWith("-release") || opt.startsWith("--release")
+      )
+  }
+
+  // Link against system CBLAS (OpenBLAS) with rpath for runtime
+  override def nativeLinkingOptions = Task {
+    val blasLib = sys.env.getOrElse(
+      "BLAS_LIB_PATH",
+      os.proc("nix", "eval", "--raw", "nixpkgs#blas.outPath")
+        .call(check = false)
+        .out
+        .trim() + "/lib"
+    )
+    super.nativeLinkingOptions() ++ Seq(s"-L$blasLib", s"-Wl,-rpath,$blasLib")
+  }
+}
+
+lazy val scalaVersions = V.scala
+
+// =============================================================================
+// Cross-Platform Core Module: palladium
+// =============================================================================
+
+object palladium extends Module {
+
+  trait JvmModule extends Shared {
+    object test extends ScalaTests with CommonTestConfig {
+      override def mvnDeps = super.mvnDeps() ++
+        Seq(Lihaoyi.osLib) ++ Seq(
+          mvn"com.virtually42:shapesdsl_3:0.0.1"
+        )
+    }
+  }
+
+  object jvm extends Cross[JvmModule](scalaVersions)
+
+  trait JsModule extends Js {
+    object test extends ScalaJSTests with CommonTestConfig
+  }
+
+  object js extends Cross[JsModule](scalaVersions)
+
+  trait NativeModule extends Native {
+    // Disable multithreading to avoid OpenBLAS thread conflicts
+    override def nativeMultithreading = Some(false)
+
+    object test extends ScalaNativeTests with TestModule.Munit {
+      override def mvnDeps = super.mvnDeps() ++ Seq(Munit.munit)
+      override def nativeMultithreading = Some(false)
+
+      // Link against system CBLAS with rpath for runtime
+      override def nativeLinkingOptions = Task {
+        val blasLib = sys.env.getOrElse(
+          "BLAS_LIB_PATH",
+          os.proc("nix", "eval", "--raw", "nixpkgs#blas.outPath")
+            .call(check = false)
+            .out
+            .trim() + "/lib"
+        )
+        super.nativeLinkingOptions() ++ Seq(
+          s"-L$blasLib",
+          s"-Wl,-rpath,$blasLib"
+        )
+      }
+
+      // Add native-specific test sources alongside shared tests
+      def nativeTestSources = Task.Sources("test-native")
+      override def sources = Task { super.sources() ++ nativeTestSources() }
+    }
+  }
+
+  object native extends Cross[NativeModule](scalaVersions)
+}
+
+// =============================================================================
+// JVM-Only Benchmark Module
+// =============================================================================
+
+object benchmark extends CommonSettings {
+  def moduleDeps = Seq(palladium.jvm(scalaVersions))
+}
+
+object `benchmark-native` extends CommonSettings with ScalaNativeModule {
+  def scalaNativeVersion = V.scalaNative
+  def moduleDeps = Seq(palladium.native(scalaVersions))
+  override def nativeMultithreading = Some(false)
+
+  override def scalacOptions = Task {
+    super
+      .scalacOptions()
+      .filterNot(opt =>
+        opt.startsWith("-release") || opt.startsWith("--release")
+      )
+  }
+
+  override def nativeLinkingOptions = Task {
+    val blasLib = sys.env.getOrElse(
+      "BLAS_LIB_PATH",
+      os.proc("nix", "eval", "--raw", "nixpkgs#blas.outPath")
+        .call(check = false)
+        .out
+        .trim() + "/lib"
+    )
+    val cudaLib = sys.env.getOrElse(
+      "CUDA_LIB_PATH",
+      os.proc(
+        "bash",
+        "-c",
+        "NIXPKGS_ALLOW_UNFREE=1 nix eval --impure --raw nixpkgs#cudaPackages.cudatoolkit.outPath"
+      ).call(check = false)
+        .out
+        .trim() + "/lib"
+    )
+    super.nativeLinkingOptions() ++ Seq(
+      s"-L$blasLib",
+      s"-Wl,-rpath,$blasLib",
+      s"-L$cudaLib",
+      s"-Wl,-rpath,$cudaLib"
+    )
+  }
+}
+
+// =============================================================================
+// JVM-Only Web Server Module
+// =============================================================================
+
+object `web-server` extends CommonSettings {
+  def moduleDeps = Seq(palladium.jvm(scalaVersions))
+
+  override def mvnDeps = super.mvnDeps() ++ Seq(
+    Tapir.nettyServerSync,
+    Tapir.jsonCirce
+  )
+
+  object test extends ScalaTests with CommonTestConfig
+}
+
+// =============================================================================
+// Scala.js Web Frontend Module
+// =============================================================================
+
+object `web-frontend` extends CommonSettings with ScalaJSModule {
+  def scalaJSVersion = V.scalaJS
+  def moduleDeps = Seq(palladium.js(scalaVersions))
+
+  override def mvnDeps = super.mvnDeps() ++ Seq(
+    ScalaJsDom.dom,
+    Lihaoyi.sourcecode
+  )
+
+  // ES Module output for Vite integration
+  override def moduleKind = ModuleKind.ESModule
+
+  object test extends ScalaJSTests with CommonTestConfig
+}

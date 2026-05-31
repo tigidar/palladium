@@ -1,0 +1,40 @@
+package build.deps
+
+import mill.*, scalalib.*
+import build.deps.{Versions => V}
+
+/** N => Only available on Native J => Only available on JVM S => Only available
+  * on Scala.js Nothing implies multi-platform support
+  */
+
+object Lihaoyi {
+  def sourcecode = mvn"com.lihaoyi::sourcecode::${V.Lihaoyi.sourcecode}"
+  def osLib = mvn"com.lihaoyi::os-lib::${V.Lihaoyi.osLib}"
+}
+
+object Munit {
+  def munit = mvn"org.scalameta::munit::${V.munit}"
+}
+
+object Scodec {
+  def core = mvn"org.scodec::scodec-core::${V.Scodec.core}"
+}
+
+object SafeTensors {
+  def safetensorsScala = mvn"no.virtual-architect::safetensors-scala::${V.SafeTensors.scala}"
+}
+
+object Tapir {
+
+  /** J - JVM only */
+  def nettyServerSync =
+    mvn"com.softwaremill.sttp.tapir::tapir-netty-server-sync:${V.Tapir.tapir}"
+  def jsonCirce =
+    mvn"com.softwaremill.sttp.tapir::tapir-json-circe:${V.Tapir.tapir}"
+}
+
+object ScalaJsDom {
+
+  /** S - Scala.js only */
+  def dom = mvn"org.scala-js::scalajs-dom::${V.ScalaJs.dom}"
+}
