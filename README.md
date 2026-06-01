@@ -21,6 +21,11 @@ Scala Native.
 
 ## A transformer, block by block
 
+> **Note:** this DSL surface is still very much a work in progress and hasn't had
+> a lot of attention yet — the `Scope`/named-dimension ergonomics shown below are
+> being shaped as the rest of the library settles. Expect rough edges and naming
+> to shift; treat the blocks here as a design sketch rather than a frozen API.
+
 The fastest way to feel the library is to build a Transformer from scratch — not
 by reaching for a `Transformer()` constructor, but by *deriving* one from a
 handful of tiny, pure building blocks. Every block below is an ordinary
@@ -37,13 +42,14 @@ the entire attention mechanism.
 import palladium.ein.*
 import palladium.ein.EinDsl.*
 import palladium.ein.EinDsl.syntax.*   // `.eval`, `.softmax`, `.elemMul`, …
+import sourcecode.Name                 // a layer can read its own binding name
 
 // The DSL's initializers (xavier, …) draw from an ambient java.util.Random.
 given java.util.Random = java.util.Random(0L)
 
-// He-style init as a plain array — a weight is just numbers.
-def randn(n: Int, fanIn: Int)(using rng: java.util.Random): Array[Double] =
-  val s = math.sqrt(2.0 / fanIn); Array.fill(n)(rng.nextGaussian() * s)
+// `EinDsl.*` also brings an ambient `Scope` into play — a parameter-name prefix,
+// rooted at the empty scope — so top-level params are named purely by binding,
+// and a reusable layer just pushes a path segment onto it (Block 1).
 ```
 
 ### Block 0 — a named tensor and its shape
@@ -84,31 +90,46 @@ Initializers are `xavier`, `zeros`, and `uniform(lo, hi)`; literal values work
 too — `weight(features -> hidden, 1.0, 2.0, 3.0, …)`. The `->` is just a
 `(Dim, Dim)` tuple, read as *from → to*.
 
-Those factories take the param name from the binding, which is exactly what you
-want in straight-line code but *not* when you reuse a layer as a function — a
-Transformer stamps out the same shape dozens of times, and each instance needs a
-distinct parameter name. So our reusable helper threads an explicit `scope` and
-builds the `Ein.Param` directly. (This is precisely the trade-off the library's
-own `Block` atoms make: scoped names, built generically.)
+Those factories take the param name from the binding — exactly what you want in
+straight-line code, but *not* when you reuse a layer as a function. A Transformer
+stamps out the same shape dozens of times, and each instance needs a *distinct*
+parameter name; yet every `val` inside the function body is named the same on
+every call. The binding alone is the wrong axis to disambiguate on.
+
+The fix keeps the binding for the *leaf* name and adds an ambient `Scope` for the
+*prefix*. `Scope` is a `given` threaded implicitly; `scoped("…")` pushes a path
+segment onto it, and the leaf factories (`weight`, `bias`) prepend whatever scope
+is in effect. So a reusable `linear` is still just `weight`/`bias` — no
+`Ein.Param`, no `TensorData`, no `"…W"` string literals — and `sourcecode.Name`
+supplies the scope segment from the call's *own* binding (`q`, `k`, `v`, …):
 
 ```scala
-def linear(scope: String, in: Dim, out: Dim)(x: Ein[Double])(using rng: java.util.Random): Ein[Double] =
-  val w = Ein.Param(s"$scope.W", List(out, in),
-            TensorData.fromArray(List(out, in), randn(out.size * in.size, in.size)))
-  val b = Ein.Param(s"$scope.b", List(out),
-            TensorData.fromArray(List(out), Array.fill(out.size)(0.0)))
-  (w * x) + b          // `*` contracts the shared `in` dim; `+` broadcasts the bias over it
+def linear(in: Dim, out: Dim)(x: Ein[Double])(using Scope, nm: Name, rng: java.util.Random): Ein[Double] =
+  scoped(nm.value) {                  // push this call's binding (e.g. "q") onto the scope
+    val w = weight(in -> out, xavier) // Ein.Param("q.w", [out, in]), Xavier-init
+    val b = bias(out, zeros)          // Ein.Param("q.b", [out])
+    (w * x) + b                       // `*` contracts the shared `in` dim; `+` broadcasts the bias
+  }
 
-// linear("proj", model, model)(x)  ⟶  shape [model, seq]
+// val proj = linear(model, model)(x)  ⟶  params "proj.w","proj.b";  shape [model, seq]
 ```
+
+The discriminator now comes from the binding, so each `val q/k/v = linear(…)`
+lands in its own scope automatically. Where there *is* no binding to capture — a
+loop body — you push the index yourself with `scoped(s"h$h")`. That index is the
+one honest string that survives, and it's *data* (a head number), not a
+hand-written parameter name. This is the same trade-off the library's own `Block`
+atoms make: scoped names, built generically.
 
 ### Block 2 — scaled dot-product attention (one head)
 
 This is the heart of a Transformer, and it falls straight out of the contraction
 rule. The catch: queries and keys both come from the same `[seq, model]` tensor,
-so we must *rename* the key/value sequence axis to `kSeq` — otherwise `Q × K`
-would contract over `seq` too. Renaming is a zero-cost `Ein.Reshape` to the same
-sizes under new names. Then `Q × K` contracts only over `dk`, leaving a
+so we must *rename* the key/value sequence axis — otherwise `Q × K` would contract
+over `seq` too. `renameDim(seq -> kSeq)` is a zero-cost `Reshape` that swaps the
+axis name (and the new `kSeq` even takes *its* name from its own binding). We pass
+the `seq` dim in as a *value* rather than looking it up by string, so there isn't
+a `"seq"` literal in sight. Then `Q × K` contracts only over `dk`, leaving a
 `[seq, kSeq]` score matrix.
 
 ```scala
@@ -116,22 +137,24 @@ sizes under new names. Then `Q × K` contracts only over `dk`, leaving a
 def scaleBy(e: Ein[Double], c: Double): Ein[Double] =
   e.elemMul(Ein.Fill(c, e.outputDims))
 
-def attentionHead(name: String, model: Dim, dk: Dim)(x: Ein[Double])(using java.util.Random): Ein[Double] =
-  val kSeq = Dim("kSeq", x.outputDims.find(_.name == "seq").get.size)
-  val xKV  = Ein.Reshape(x, x.outputDims.map(d => if d.name == "seq" then kSeq else d))
+def attentionHead(model: Dim, dk: Dim, seq: Dim)(x: Ein[Double])(using Scope, java.util.Random): Ein[Double] =
+  val kSeq = seq.size.dim                                       // Dim("kSeq", 16) — name from the binding
+  val xKV  = x.renameDim(seq -> kSeq)                           // rename the key/value sequence axis
 
-  val q = linear(s"$name.q", model, dk)(x)                      // [dk, seq]
-  val k = linear(s"$name.k", model, dk)(xKV)                    // [dk, kSeq]
-  val v = linear(s"$name.v", model, dk)(xKV)                    // [dk, kSeq]
+  val q = linear(model, dk)(x)                                  // params "q.*"  → [dk, seq]
+  val k = linear(model, dk)(xKV)                                // params "k.*"  → [dk, kSeq]
+  val v = linear(model, dk)(xKV)                                // params "v.*"  → [dk, kSeq]
 
   val scores  = scaleBy(q * k, 1.0 / math.sqrt(dk.size))        // [seq, kSeq]  (contracts dk)
-  val weights = scores.softmax("kSeq")                          // [seq, kSeq]  (normalize keys)
+  val weights = scores.softmax(kSeq)                            // [seq, kSeq]  (normalize keys)
   weights * v                                                   // [seq, dk]    (contracts kSeq)
 ```
 
 Read the three contractions straight off the dim names: `q * k` shares `dk`,
-`softmax` normalizes along `kSeq`, and `weights * v` shares `kSeq`. No index
-arithmetic, no manual stride juggling — the names *are* the bookkeeping.
+`softmax(kSeq)` normalizes along the key axis, and `weights * v` shares `kSeq`. No
+index arithmetic, no manual stride juggling, and — because `seq`/`kSeq` are passed
+and bound as `Dim` values — no axis names typed as strings. The names *are* the
+bookkeeping.
 
 ### Block 3 — multi-head attention
 
@@ -141,11 +164,14 @@ output projection*. Summing the per-head `Wᴼ` projections is mathematically
 identical to concatenating the heads and projecting once.
 
 ```scala
-def multiHead(name: String, model: Dim, heads: Int, dk: Dim)(x: Ein[Double])(using java.util.Random): Ein[Double] =
+def multiHead(model: Dim, heads: Int, dk: Dim, seq: Dim)(x: Ein[Double])(using Scope, java.util.Random): Ein[Double] =
   (0 until heads)
     .map { h =>
-      val ctx = attentionHead(s"$name.h$h", model, dk)(x)       // [seq, dk]
-      linear(s"$name.o$h", dk, model)(ctx)                      // [model, seq]
+      scoped(s"h$h") {                                          // the one place an index appears
+        val ctx = attentionHead(model, dk, seq)(x)              // params "h$h.q.*", …  → [seq, dk]
+        val out = linear(dk, model)(ctx)                        // params "h$h.out.*"   → [model, seq]
+        out
+      }
     }
     .reduce(_ + _)                                              // [model, seq]
 ```
@@ -153,27 +179,29 @@ def multiHead(name: String, model: Dim, heads: Int, dk: Dim)(x: Ein[Double])(usi
 ### Block 4 — the position-wise feed-forward network
 
 ```scala
-def feedForward(name: String, model: Dim, hidden: Dim)(x: Ein[Double])(using java.util.Random): Ein[Double] =
-  val h = gelu(linear(s"$name.in", model, hidden)(x))          // [hidden, seq]
-  linear(s"$name.out", hidden, model)(h)                       // [model, seq]
+def feedForward(model: Dim, hidden: Dim)(x: Ein[Double])(using Scope, java.util.Random): Ein[Double] =
+  val up   = gelu(linear(model, hidden)(x))                    // params "up.*"    → [hidden, seq]
+  val down = linear(hidden, model)(up)                         // params "down.*"  → [model, seq]
+  down
 ```
 
 ### Block 5 — Add & Norm (residual + layer normalization)
 
-`LayerNorm` carries its own learnable `scale`/`bias` params and the dims to
-normalize over. Element-wise `+` matches operands *by name*, so the residual
+`LayerNorm` carries its own learnable `scale`/`shift` params and the dims to
+normalize over (named by `Dim` value — `model.name` — not a string). Element-wise
+`+` matches operands *by name*, so the residual
 works even though attention hands back `[model, seq]` and the input is
 `[seq, model]`.
 
 ```scala
-def layerNorm(name: String, model: Dim)(x: Ein[Double]): Ein[Double] =
-  val scale = Ein.Param(s"$name.scale", List(model), TensorData.fill(List(model), 1.0))
-  val bias  = Ein.Param(s"$name.bias",  List(model), TensorData.fromArray(List(model), Array.fill(model.size)(0.0)))
-  Ein.LayerNorm(x, scale, bias, List("model"), eps = 1e-5)
+def layerNorm(model: Dim)(x: Ein[Double])(using Scope): Ein[Double] =
+  val scale = param(model)(ones)                               // Ein.Param("…scale", [model]), ones
+  val shift = param(model)(zeros)                              // Ein.Param("…shift", [model]), zeros
+  Ein.LayerNorm(x, scale, shift, List(model.name), eps = 1e-5) // normalize over the model axis
 
 // the classic "x + sublayer(x), then normalize"
-def addNorm(name: String, model: Dim)(x: Ein[Double], sublayer: Ein[Double]): Ein[Double] =
-  layerNorm(name, model)(x + sublayer)
+def addNorm(model: Dim)(x: Ein[Double], sublayer: Ein[Double])(using Scope): Ein[Double] =
+  layerNorm(model)(x + sublayer)
 ```
 
 ### Block 6 — assembling one Transformer block
@@ -181,14 +209,16 @@ def addNorm(name: String, model: Dim)(x: Ein[Double], sublayer: Ein[Double]): Ei
 Now the famous diagram is literally two `addNorm`s:
 
 ```scala
-def transformerBlock(name: String, model: Dim, heads: Int, dk: Dim, hidden: Dim)(x: Ein[Double])(using java.util.Random): Ein[Double] =
-  val a = addNorm(s"$name.ln1", model)(x, multiHead(s"$name.attn", model, heads, dk)(x))
-  val b = addNorm(s"$name.ln2", model)(a, feedForward(s"$name.ffn", model, hidden)(a))
+def transformerBlock(model: Dim, heads: Int, dk: Dim, hidden: Dim, seq: Dim)(x: Ein[Double])(using Scope, java.util.Random): Ein[Double] =
+  val attn = scoped("attn") { multiHead(model, heads, dk, seq)(x) }
+  val a    = scoped("ln1")  { addNorm(model)(x, attn) }
+  val ff   = scoped("ffn")  { feedForward(model, hidden)(a) }
+  val b    = scoped("ln2")  { addNorm(model)(a, ff) }
   b   // shape preserved: [seq, model] in, [seq, model] out
 
 // stacking is ordinary function composition, because the shape round-trips:
-def encoder(layers: Int, model: Dim, heads: Int, dk: Dim, hidden: Dim)(x: Ein[Double])(using java.util.Random): Ein[Double] =
-  (0 until layers).foldLeft(x)((h, i) => transformerBlock(s"layer$i", model, heads, dk, hidden)(h))
+def encoder(layers: Int, model: Dim, heads: Int, dk: Dim, hidden: Dim, seq: Dim)(x: Ein[Double])(using Scope, java.util.Random): Ein[Double] =
+  (0 until layers).foldLeft(x)((h, i) => scoped(s"layer$i") { transformerBlock(model, heads, dk, hidden, seq)(h) })
 ```
 
 ### Block 7 — a complete model you can actually run
@@ -206,16 +236,14 @@ val hidden = 256.dim
 
 // a sentence of 16 token ids, as concrete integer data
 val ids   = TensorData.fromArray(List(seq), Array.tabulate(seq.size)(i => (i * 7) % vocab.size))
-val table = Ein.Param("tok_embed", List(vocab, model),
-              TensorData.fromArray(List(vocab, model), randn(vocab.size * model.size, model.size)))
-val pos   = Ein.Param("pos_embed", List(seq, model),
-              TensorData.fromArray(List(seq, model), Array.fill(seq.size * model.size)(0.0)))
+val table = param(vocab, model)(xavier)              // Ein.Param("table", [vocab, model])
+val pos   = param(seq, model)(zeros)                 // Ein.Param("pos",   [seq, model])
 
-val embedded = Ein.Gather(table, ids, "vocab")       // [seq, model]
+val embedded = Ein.Gather(table, ids, vocab.name)    // [seq, model]  (look up the "vocab" axis)
 val h0       = embedded + pos                         // [seq, model]
-val out      = encoder(layers = 2, model, heads, dk, hidden)(h0)
-val logits   = linear("lm_head", model, vocab)(out)  // [vocab, seq]
-val probs    = logits.softmax("vocab")               // next-token distribution per position
+val out      = encoder(layers = 2, model, heads, dk, hidden, seq)(h0)
+val logits   = linear(model, vocab)(out)             // params "logits.*"  → [vocab, seq]
+val probs    = logits.softmax(vocab)                 // next-token distribution per position
 
 val result: TensorData[Double] = probs.eval()        // forward pass — actually computes!
 ```
