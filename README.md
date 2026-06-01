@@ -2,7 +2,7 @@
 
 A Scala 3 framework for neural networks: pure-data expression trees,
 reverse-mode automatic differentiation, an einsum-style tensor DSL, and a
-lowering pipeline that emits portable C — all running on JVM, Scala.js, and
+lowering pipeline that emits portable C / BLAS and CUDA (wip) — all running on JVM, Scala.js, and
 Scala Native.
 
 > ## 🚧 UNDER CONSTRUCTION 🚧
