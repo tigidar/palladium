@@ -2,7 +2,7 @@ package build.deps
 
 object Versions {
 
-  lazy val scala = "3.8.2"
+  lazy val scala = "3.8.3"
   lazy val scalaJS = "1.20.1"
   lazy val scalaNative = "0.5.10"
   lazy val munit = "1.2.1"

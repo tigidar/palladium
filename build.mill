@@ -4,7 +4,38 @@
 package build
 
 import mill.*, scalalib.*, scalajslib.*, scalajslib.api.*, scalanativelib.*
+import mill.scalalib.publish.*
 import deps.{Versions => V, Lihaoyi, Munit, Scodec, SafeTensors, Tapir, ScalaJsDom}
+
+// =============================================================================
+// Publish coordinates
+// =============================================================================
+
+object Publish {
+  val organization   = "no.virtual-architect"
+  val projectVersion = "0.1.0-SNAPSHOT"
+}
+
+trait PalladiumPublish extends PublishModule {
+  def publishVersion = Publish.projectVersion
+
+  def pomSettings = PomSettings(
+    description    = "Palladium — neural networks in Scala 3 with reverse-mode autodiff and C/BLAS/CUDA lowering.",
+    organization   = Publish.organization,
+    url            = "https://github.com/tigidar/palladium",
+    licenses       = Seq(License.`Apache-2.0`),
+    versionControl = VersionControl.github("tigidar", "palladium"),
+    developers     = Seq(
+      Developer(
+        id              = "tigidar",
+        name            = "tigidar",
+        url             = "https://github.com/tigidar",
+        organization    = Some("virtual-architect"),
+        organizationUrl = Some("https://virtual-architect.no")
+      )
+    )
+  )
+}
 
 // =============================================================================
 // Common Traits (following tagless patterns)
@@ -18,7 +49,9 @@ trait CommonTestConfig extends TestModule.Munit {
   override def mvnDeps = super.mvnDeps() ++ Seq(Munit.munit)
 }
 
-trait Shared extends CrossScalaModule with PlatformScalaModule {
+trait Shared extends CrossScalaModule with PlatformScalaModule with PalladiumPublish {
+  def artifactName = "palladium"
+
   override def mvnDeps = super.mvnDeps() ++ Seq(
     Lihaoyi.sourcecode,
     Scodec.core,
@@ -67,7 +100,7 @@ object palladium extends Module {
     object test extends ScalaTests with CommonTestConfig {
       override def mvnDeps = super.mvnDeps() ++
         Seq(Lihaoyi.osLib) ++ Seq(
-          mvn"com.virtually42:shapesdsl_3:0.0.1"
+          mvn"no.virtual-architect::shapesdsl-core::0.1.0-SNAPSHOT"
         )
     }
   }
@@ -164,7 +197,9 @@ object `benchmark-native` extends CommonSettings with ScalaNativeModule {
 // JVM-Only Web Server Module
 // =============================================================================
 
-object `web-server` extends CommonSettings {
+object `web-server` extends CommonSettings with PalladiumPublish {
+  def artifactName = "palladium-web-server"
+
   def moduleDeps = Seq(palladium.jvm(scalaVersions))
 
   override def mvnDeps = super.mvnDeps() ++ Seq(
